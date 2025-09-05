@@ -1,0 +1,1100 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Byggdagbok</title>
+  <!--
+    ============================================================
+    Gaussian Splatting – Byggdagbok (100% klientsida, 1-fil-app)
+    ------------------------------------------------------------
+    Arkitektur
+    - Enkel SPA med hash-router:
+        #week/{id}        -> visar en vecka
+        #compare/{a}/{b}  -> jämförläge
+    - Lagring:
+        * localStorage:
+            - nyckel "gsDiary.v1.weeks" : JSON-array av veckoposter:
+              {
+                id: "uuid",
+                label: "Vecka 35",
+                embedSrc: "https://poly.cam/capture/809a898f-89a4-42e8-83ed-9d92e4da71c1/embed" title="Polycam capture viewer" style="height:100%;width:100%;max-height:720px;max-width:1280px;min-height:280px;min-width:280px" frameborder="0"></iframe>",
+                description: "text",
+                thumbBlobId: "files:thumb:uuid" | null,
+                pdfBlobIds: ["files:pdf:uuid", ...],
+                createdAt: 1733184000000
+              }
+            - nyckel "gsDiary.theme" : "light" | "dark"
+            - nyckel "gsDiary.session" : { loggedIn: true } i sessionStorage
+        * IndexedDB:
+            - databas "gsDiaryDB", objectStore "files"
+            - nyckel: sträng t.ex. "files:thumb:uuid" eller "files:pdf:uuid"
+            - värde: { blob: Blob, name: string, type: string, createdAt: number }
+    - Säkerhet:
+        * Endast Polycam-iframe tillåts. Vi sanerar användarens HTML genom att:
+          1) parse:a i ett <template>, 2) kräva exakt en <iframe>,
+          3) validera URL (https och hostname slutar med "poly.cam"),
+          4) bygga en NY <iframe> med vitlistade attribut:
+             src, title, loading="lazy", allowfullscreen, referrerpolicy="no-referrer"
+          5) sandbox på containern (ej allow-downloads).
+        * Blob-URL:er skapas endast lokalt (inga downloads-knappar).
+        * Högerklick blockeras i viewer- och PDF-ytor (best effort).
+    - Prestanda:
+        * Tumnaglar nedskalas via <canvas> (maxbredd ~800px) innan lagring.
+        * Iframes och tumnaglar använder loading="lazy".
+        * PDF-blobs hämtas först när en vecka visas/öppnas.
+    - Återställning:
+        * Klicka på "Rensa lagring" i hjälppanelen eller kör i konsolen:
+            localStorage.removeItem("gsDiary.v1.weeks");
+            indexedDB.deleteDatabase("gsDiaryDB");
+            sessionStorage.removeItem("gsDiary.session");
+    ============================================================
+  -->
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --panel: rgba(255,255,255,0.7);
+      --frost: blur(10px);
+      --text: #111;
+      --muted: #667085;
+      --border: #e5e7eb;
+      --accent: #4f46e5;
+      --accent-2: #22c55e;
+      --danger: #ef4444;
+      --shadow: 0 10px 30px rgba(0,0,0,0.08);
+      --radius: 16px;
+    }
+    :root.dark {
+      --bg: #0b0e12;
+      --panel: rgba(20,22,27,0.7);
+      --text: #eef2f6;
+      --muted: #9aa4b2;
+      --border: #1f2937;
+      --shadow: 0 10px 30px rgba(0,0,0,0.35);
+      --accent: #818cf8;
+      --accent-2: #34d399;
+      --danger: #f87171;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0; padding: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, Apple Color Emoji, Segoe UI Emoji;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.4;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:focus { outline: 3px solid var(--accent); border-radius: 6px; }
+    button, input, textarea, select {
+      font: inherit; color: inherit;
+      background: transparent; border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 12px;
+    }
+    button { cursor: pointer; background: var(--panel); backdrop-filter: var(--frost); box-shadow: var(--shadow); border: 1px solid var(--border); }
+    button:hover { transform: translateY(-1px); }
+    button:focus { outline: 3px solid var(--accent); }
+    .btn-primary { background: var(--accent); color: white; border-color: transparent; }
+    .btn-ghost { background: transparent; border-color: var(--border); }
+    .btn-danger { background: var(--danger); color: white; border-color: transparent; }
+    .chip { display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border:1px solid var(--border); border-radius: 999px; background: var(--panel); }
+    .icon { width: 18px; height: 18px; display:inline-block; vertical-align: -3px; }
+    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .hidden { display: none !important; }
+
+    /* Layout */
+    .app {
+      display: grid; grid-template-columns: 320px 1fr;
+      min-height: 100vh;
+    }
+    .sidebar {
+      position: sticky; top: 0; height: 100vh; overflow: auto;
+      padding: 16px; border-right: 1px solid var(--border);
+      background: var(--panel); backdrop-filter: var(--frost);
+    }
+    .sidebar-header { display:flex; align-items:center; justify-content: space-between; gap: 8px; }
+    .brand { display:flex; align-items:center; gap:10px; font-weight: 700; }
+    .brand .logo { width: 28px; height: 28px; border-radius: 8px; background: linear-gradient(135deg, var(--accent), var(--accent-2)); box-shadow: var(--shadow); }
+    .search { margin: 12px 0; display:flex; gap:8px; }
+    .search input { flex:1; background:white; border-color: var(--border); }
+    :root.dark .search input { background: #0f1318; }
+    .week-list { display:flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+    .week-item {
+      display:grid; grid-template-columns: 44px 1fr auto; gap: 10px; align-items:center;
+      padding: 8px; border:1px solid var(--border); border-radius: 12px; background: white; box-shadow: var(--shadow);
+    }
+    :root.dark .week-item { background: #0f1318; }
+    .thumb {
+      width: 44px; height: 44px; border-radius: 10px; overflow: hidden; display:flex; align-items:center; justify-content:center; background: #e2e8f0;
+      color:#334155; font-weight:700;
+    }
+    :root.dark .thumb { background: #111827; color:#9ca3af; }
+    .week-item .label { font-weight: 600; }
+    .menu-btn { width: 36px; height: 36px; border-radius: 8px; display:flex; align-items:center; justify-content:center; }
+    .content {
+      padding: 18px 22px; display:flex; flex-direction: column; gap: 16px;
+    }
+    .topbar {
+      display:flex; align-items:center; justify-content: space-between; gap: 12px;
+      position: sticky; top:0; z-index: 5; padding: 10px 0 6px 0; background: linear-gradient(var(--bg) 70%, transparent);
+    }
+    .title { font-size: clamp(18px, 2vw, 24px); font-weight: 800; letter-spacing: 0.2px; }
+    .card {
+      background: var(--panel); backdrop-filter: var(--frost); border: 1px solid var(--border);
+      border-radius: var(--radius); box-shadow: var(--shadow); padding: 14px;
+    }
+    .viewer {
+      position: relative; border-radius: 16px; overflow:hidden; border:1px solid var(--border);
+    }
+    .viewer .frame {
+      width: 100%; aspect-ratio: 16/9; border: 0; display:block; background:#0b1220;
+    }
+    .viewer .toolbar {
+      position: absolute; top: 10px; right: 10px; display:flex; gap:8px; z-index:2;
+    }
+    .split {
+      display:grid; grid-template-columns: 1fr 1fr; gap: 12px;
+    }
+    @media (max-width: 900px) {
+      .app { grid-template-columns: 1fr; }
+      .sidebar { position: relative; height: auto; }
+      .split { grid-template-columns: 1fr; }
+    }
+    .muted { color: var(--muted); }
+    .desc { min-height: 120px; width: 100%; background: white; border:1px dashed var(--border); border-radius: 12px; padding: 10px; }
+    :root.dark .desc { background: #0f1318; }
+
+    /* Modal */
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.35);
+      display:flex; align-items:center; justify-content:center; z-index: 50;
+    }
+    .modal {
+      width: min(820px, 94vw); max-height: 90vh; overflow:auto; background: var(--bg);
+      border-radius: 16px; box-shadow: var(--shadow); border:1px solid var(--border); padding: 16px;
+    }
+    .modal header { display:flex; align-items:center; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+    .modal footer { display:flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+    .field { display:flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+    .field label { font-size: 14px; font-weight: 600; }
+    .pdf-list { display:grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 8px; }
+    .pdf-card { padding:10px; border:1px solid var(--border); border-radius: 12px; background: white; display:flex; justify-content: space-between; gap: 8px; align-items:center; }
+    :root.dark .pdf-card { background:#0f1318; }
+    .spinner { width:18px; height:18px; border-radius:999px; border:2px solid var(--border); border-top-color: var(--accent); animation: spin .9s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* Login */
+    .login {
+      min-height: 100vh; display:grid; place-items:center; padding: 24px;
+    }
+    .login-card { width:min(420px, 94vw); }
+    .login-card .logo { width: 44px; height: 44px; border-radius: 12px; background: linear-gradient(135deg, var(--accent), var(--accent-2)); box-shadow: var(--shadow); }
+
+    /* Utility */
+    .sr-only { position:absolute; left:-10000px; width:1px; height:1px; top:auto; overflow:hidden; }
+    .danger { color: var(--danger); }
+    .toolbar .chip { background: rgba(255,255,255,0.6); }
+    :root.dark .toolbar .chip { background: rgba(16,18,23,0.7); }
+  </style>
+</head>
+<body>
+  <div id="loginView" class="login">
+    <form id="loginForm" class="card login-card" aria-label="Inloggning">
+      <div class="row" style="justify-content:center; margin-bottom:10px;">
+        <div class="logo"></div>
+      </div>
+      <h1 class="title" style="text-align:center;">Byggdagbok</h1>
+      <p class="muted" style="text-align:center;">Logga in för att fortsätta</p>
+      <div class="field">
+        <label for="user">Användarnamn</label>
+        <input id="user" name="user" autocomplete="username" required />
+      </div>
+      <div class="field">
+        <label for="pass">Lösenord</label>
+        <input id="pass" name="pass" type="password" autocomplete="current-password" required />
+      </div>
+      <div class="row" style="justify-content:space-between;">
+        <button type="submit" class="btn-primary">Logga in</button>
+        <span id="loginError" class="danger" aria-live="polite"></span>
+      </div>
+      <p class="muted" style="margin-top:12px;font-size:13px;">Demo-konto: <code>admin1</code> / <code>admin1</code></p>
+    </form>
+  </div>
+
+  <div id="app" class="app hidden" aria-hidden="true">
+    <!-- Sidebar -->
+    <aside id="sidebar" class="sidebar" aria-label="Veckolista">
+      <div class="sidebar-header">
+        <div class="brand" title="Gaussian Splatting – Byggdagbok">
+          <div class="logo" aria-hidden="true"></div>
+          <span>Byggdagbok</span>
+        </div>
+        <div class="row">
+          <button id="themeBtn" class="menu-btn" title="Växla tema (ljust/mörkt)" aria-pressed="false">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3a9 9 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+          </button>
+          <button id="collapseBtn" class="menu-btn" title="Dölj/visa sidopanel">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M8 6l-4 6 4 6M16 6l4 6-4 6"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="search" role="search">
+        <input id="searchInput" type="search" placeholder="Sök vecka eller text..." aria-label="Sök" />
+        <button id="addWeekBtn" class="btn-primary" title="Lägg till vecka">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+      </div>
+      <div id="emptyState" class="card hidden" aria-live="polite">
+        <p><strong>Inga veckor ännu.</strong></p>
+        <p class="muted">Klicka på <em>Lägg till vecka</em> för att starta. En exempelpost skapas automatiskt första gången.</p>
+      </div>
+      <nav id="weekList" class="week-list" aria-label="Veckor"></nav>
+      <details class="card" style="margin-top:12px;">
+        <summary><strong>Hjälp</strong></summary>
+        <ul>
+          <li><strong>Lägg till vecka:</strong> knappen “Lägg till vecka”.</li>
+          <li><strong>Polycam:</strong> klistra in exakt <code>&lt;iframe ...&gt;&lt;/iframe&gt;</code> från <em>poly.cam</em>.</li>
+          <li><strong>Tumnagel &amp; PDF:</strong> ladda upp i dialogen. Tumnageln skalas ner.</li>
+          <li><strong>Jämförläge:</strong> knappen “Jämför veckor” i toppbaren.</li>
+          <li><strong>Begränsningar:</strong> vi kan inte styra 3D-renderingen p.g.a. cross-origin.</li>
+          <li><button id="resetBtn" class="btn-ghost">Rensa lagring</button></li>
+        </ul>
+      </details>
+      <div class="row" style="margin-top:10px;">
+        <button id="logoutBtn" class="btn-ghost">Logga ut</button>
+      </div>
+    </aside>
+
+    <!-- Main -->
+    <main class="content" id="main" aria-live="polite">
+      <div class="topbar">
+        <div class="row">
+          <span class="title" id="pageTitle">Översikt</span>
+          <span id="countChip" class="chip"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 7h18M3 12h18M3 17h18"/></svg><span id="countText">0 veckor</span></span>
+        </div>
+        <div class="row">
+          <button id="compareToggle" class="btn-ghost"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 6h7v12H4zM13 6h7v12h-7z"/></svg> Jämför veckor</button>
+          <a id="openNewTab" class="btn-ghost hidden" target="_blank" rel="noopener">Öppna i ny flik</a>
+          <button id="hideSidebar" class="btn-ghost" title="Fokusläge (dölj panel)">Fokusläge</button>
+        </div>
+      </div>
+
+      <section id="weekView" class="card hidden" aria-labelledby="weekTitle">
+        <h2 id="weekTitle" class="row" style="justify-content:space-between;">
+          <span></span>
+          <span class="muted" id="createdAt"></span>
+        </h2>
+        <div id="viewerContainer" class="viewer" aria-label="Polycam-visare" oncontextmenu="event.preventDefault()">
+          <div class="toolbar" role="toolbar" aria-label="Visarkontroller">
+            <button id="fsBtn" class="menu-btn" title="Fullskärm"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+            <button id="exitFsBtn" class="menu-btn" title="Återställ" hidden><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M9 4H4v5M20 4h-5M4 20h5M20 20h-5"/></svg></button>
+          </div>
+          <div id="iframeMount"></div>
+        </div>
+
+        <div class="field">
+          <label for="desc">Anteckningar</label>
+          <textarea id="desc" class="desc" placeholder="Skriv anteckningar här..."></textarea>
+          <span id="saveHint" class="muted" aria-live="polite" style="font-size:12px;">Sparas automatiskt</span>
+        </div>
+
+        <div class="field">
+          <label>PDF-bilagor</label>
+          <div id="pdfList" class="pdf-list"></div>
+          <span class="muted" style="font-size:12px;">Klicka för att förhandsvisa i modal. Nedladdning är avstängd.</span>
+        </div>
+
+        <div class="row" style="justify-content:flex-end;">
+          <button id="editWeekBtn" class="btn-ghost">Redigera</button>
+        </div>
+      </section>
+
+      <section id="compareView" class="card hidden" aria-labelledby="compareTitle">
+        <h2 id="compareTitle" class="title">Jämför veckor</h2>
+        <div class="row">
+          <label class="sr-only" for="selectA">Vänster vecka</label>
+          <select id="selectA"></select>
+          <label class="sr-only" for="selectB">Höger vecka</label>
+          <select id="selectB"></select>
+          <button id="swapBtn" class="btn-ghost" title="Byt plats"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M7 7h10M7 7l4-4M17 17H7m10 0-4 4"/></svg> Byt plats</button>
+        </div>
+        <div class="split" style="margin-top:12px;">
+          <div class="col card" oncontextmenu="event.preventDefault()">
+            <div class="row" style="justify-content:space-between;">
+              <strong id="titleA">—</strong>
+              <div class="row">
+                <button id="fsA" class="menu-btn" title="Fullskärm"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+              </div>
+            </div>
+            <div class="viewer">
+              <div id="mountA"></div>
+            </div>
+            <p id="descA" class="muted" style="margin:8px 0 0 0;"></p>
+          </div>
+          <div class="col card" oncontextmenu="event.preventDefault()">
+            <div class="row" style="justify-content:space-between;">
+              <strong id="titleB">—</strong>
+              <div class="row">
+                <button id="fsB" class="menu-btn" title="Fullskärm"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+              </div>
+            </div>
+            <div class="viewer">
+              <div id="mountB"></div>
+            </div>
+            <p id="descB" class="muted" style="margin:8px 0 0 0;"></p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Modal-root -->
+  <div id="modalRoot" class="hidden" aria-hidden="true"></div>
+
+  <template id="weekItemTemplate">
+    <div class="week-item">
+      <div class="thumb" aria-hidden="true"></div>
+      <div>
+        <div class="label"></div>
+        <div class="muted" style="font-size:12px;"></div>
+      </div>
+      <div class="row">
+        <button class="menu-btn viewBtn" title="Visa">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12zm11 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/></svg>
+        </button>
+        <button class="menu-btn editBtn" title="Redigera">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 20h9M16.5 3.5l4 4L7 21H3v-4L16.5 3.5z"/></svg>
+        </button>
+        <button class="menu-btn delBtn" title="Ta bort">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 6h18M8 6V4h8v2m-1 0v14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V6h10z"/></svg>
+        </button>
+      </div>
+    </div>
+  </template>
+
+  <script>
+  (() => {
+    "use strict";
+
+    // =============== Utils ===============
+    const $ = (sel, el=document) => el.querySelector(sel);
+    const $$ = (sel, el=document) => Array.from(el.querySelectorAll(sel));
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const now = () => Date.now();
+    const uuid = () => crypto.randomUUID ? crypto.randomUUID() : ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g,c=>(c^crypto.getRandomValues(new Uint8Array(1))[0]&15>>c/4).toString(16));
+    const fmtDate = ts => new Date(ts).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+    const debounce = (fn, d=250) => {
+      let t; return (...args) => { clearTimeout(t); t=setTimeout(()=>fn(...args), d); };
+    };
+
+    // =============== Theme ===============
+    const THEME_KEY = "gsDiary.theme";
+    function applyTheme() {
+      const t = localStorage.getItem(THEME_KEY) || 'light';
+      document.documentElement.classList.toggle('dark', t === 'dark');
+      $('#themeBtn')?.setAttribute('aria-pressed', String(t === 'dark'));
+    }
+    function toggleTheme() {
+      const t = localStorage.getItem(THEME_KEY) || 'light';
+      const next = t === 'light' ? 'dark' : 'light';
+      localStorage.setItem(THEME_KEY, next);
+      applyTheme();
+    }
+
+    // =============== Session / Login ===============
+    const SESSION_KEY = "gsDiary.session";
+    function isLoggedIn() {
+      try {
+        const s = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
+        return !!(s && s.loggedIn);
+      } catch { return false; }
+    }
+    function setLoggedIn() {
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify({ loggedIn: true, at: now() }));
+    }
+    function logout() {
+      sessionStorage.removeItem(SESSION_KEY);
+      location.hash = "";
+      $('#app').classList.add('hidden');
+      $('#app').setAttribute('aria-hidden', 'true');
+      $('#loginView').classList.remove('hidden');
+      $('#user').focus();
+    }
+
+    // =============== Storage (localStorage + IndexedDB) ===============
+    const WEEKS_KEY = "gsDiary.v1.weeks";
+    function loadWeeks() {
+      try { return JSON.parse(localStorage.getItem(WEEKS_KEY) || "[]"); } catch { return []; }
+    }
+    function saveWeeks(data) {
+      localStorage.setItem(WEEKS_KEY, JSON.stringify(data));
+      updateCount();
+    }
+    function listWeeks() { return loadWeeks().sort((a,b)=>b.createdAt - a.createdAt); }
+    function saveWeek(week) {
+      const all = loadWeeks();
+      all.push(week);
+      saveWeeks(all);
+      return week;
+    }
+    function updateWeek(id, patch) {
+      const all = loadWeeks();
+      const ix = all.findIndex(w => w.id === id);
+      if (ix >= 0) {
+        all[ix] = { ...all[ix], ...patch };
+        saveWeeks(all);
+        return all[ix];
+      }
+      return null;
+    }
+    function deleteWeek(id) {
+      const all = loadWeeks();
+      const w = all.find(x => x.id === id);
+      const remaining = all.filter(w => w.id !== id);
+      saveWeeks(remaining);
+      // Radera associerade blobs
+      if (w) {
+        if (w.thumbBlobId) deleteBlob(w.thumbBlobId);
+        (w.pdfBlobIds || []).forEach(deleteBlob);
+      }
+    }
+
+    // --- IndexedDB wrapper ---
+    const DB_NAME = "gsDiaryDB";
+    const STORE = "files";
+    function openDB() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open(DB_NAME, 1);
+        req.onupgradeneeded = () => {
+          const db = req.result;
+          if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+        };
+        req.onerror = () => reject(req.error);
+        req.onsuccess = () => resolve(req.result);
+      });
+    }
+    async function withStore(mode, fn) {
+      const db = await openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE, mode);
+        const store = tx.objectStore(STORE);
+        const res = fn(store);
+        tx.oncomplete = () => resolve(res);
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+    function putBlob(key, blob, name="fil", type=blob?.type || "application/octet-stream") {
+      const val = { blob, name, type, createdAt: now() };
+      return withStore('readwrite', s => s.put(val, key));
+    }
+    function getBlob(key) {
+      return withStore('readonly', s => new Promise((res, rej) => {
+        const r = s.get(key);
+        r.onsuccess = () => res(r.result || null);
+        r.onerror = () => rej(r.error);
+      }));
+    }
+    function deleteBlob(key) {
+      return withStore('readwrite', s => s.delete(key));
+    }
+
+    // =============== Image utils (thumbnail downscale + fallback avatar) ===============
+    async function downscaleImage(file, maxW=800) {
+      const img = await fileToImage(file);
+      const scale = Math.min(1, maxW / img.width);
+      const w = Math.round(img.width * scale);
+      const h = Math.round(img.height * scale);
+      const canvas = document.createElement('canvas');
+      canvas.width = w; canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+      const blob = await new Promise(res => canvas.toBlob(res, 'image/jpeg', 0.85));
+      return new File([blob], file.name.replace(/\.\w+$/, '') + '.jpg', { type: 'image/jpeg' });
+    }
+    function fileToImage(file) {
+      return new Promise((res, rej) => {
+        const img = new Image();
+        img.onload = () => res(img);
+        img.onerror = rej;
+        img.src = URL.createObjectURL(file);
+      });
+    }
+    function renderAvatar(el, label) {
+      el.textContent = (label || 'V').replace(/[^\d]+/g,'').slice(0,3) || (label?.slice(0,2) ?? 'V');
+      el.style.background = `linear-gradient(135deg, ${randColor(el.textContent)}, ${randColor(el.textContent+'x')})`;
+      el.style.color = 'white';
+    }
+    function randColor(seed) {
+      let h=0; for (let i=0;i<seed.length;i++) h = (h*31 + seed.charCodeAt(i)) % 360;
+      return `hsl(${h} 70% 45%)`;
+    }
+
+    // =============== Polycam iframe sanitization ===============
+    function sanitizePolycamIframe(htmlStr) {
+      const t = document.createElement('template');
+      t.innerHTML = (htmlStr || '').trim();
+      const iframes = t.content.querySelectorAll('iframe');
+      if (iframes.length !== 1) throw new Error('Exakt en <iframe> måste finnas.');
+      const src = iframes[0].getAttribute('src') || '';
+      let url;
+      try { url = new URL(src, location.origin); } catch { throw new Error('Ogiltig URL i iframe.'); }
+      if (url.protocol !== 'https:') throw new Error('Endast https tillåts.');
+      const host = url.hostname || '';
+      if (!host.endsWith('poly.cam')) throw new Error('Endast poly.cam-domänen tillåts.');
+      // Rekonstruera URL (bevara sök/query/hash)
+      const cleanSrc = url.href;
+      return cleanSrc;
+    }
+    function buildPolycamIframe(src, title='Polycam-modell') {
+      const iframe = document.createElement('iframe');
+      iframe.src = src;
+      iframe.title = title;
+      iframe.loading = 'lazy';
+      iframe.setAttribute('referrerpolicy', 'no-referrer');
+      iframe.setAttribute('allowfullscreen', '');
+      iframe.className = 'frame';
+      // OBS: sandbox på containern nedan (försiktiga flaggor, ej downloads)
+      return iframe;
+    }
+
+    // =============== Router ===============
+    window.addEventListener('hashchange', renderRoute);
+    function parseRoute() {
+      const h = (location.hash || '').replace(/^#/, '');
+      const seg = h.split('/').filter(Boolean);
+      if (seg[0] === 'week' && seg[1]) return { view: 'week', id: seg[1] };
+      if (seg[0] === 'compare' && seg[1] && seg[2]) return { view: 'compare', a: seg[1], b: seg[2] };
+      return { view: 'home' };
+    }
+
+    // =============== UI Build ===============
+    const els = {
+      loginView: $('#loginView'),
+      loginForm: $('#loginForm'),
+      loginError: $('#loginError'),
+      app: $('#app'),
+      sidebar: $('#sidebar'),
+      main: $('#main'),
+      weekList: $('#weekList'),
+      emptyState: $('#emptyState'),
+      searchInput: $('#searchInput'),
+      addWeekBtn: $('#addWeekBtn'),
+      resetBtn: $('#resetBtn'),
+      logoutBtn: $('#logoutBtn'),
+      themeBtn: $('#themeBtn'),
+      collapseBtn: $('#collapseBtn'),
+      hideSidebar: $('#hideSidebar'),
+      compareToggle: $('#compareToggle'),
+      openNewTab: $('#openNewTab'),
+      pageTitle: $('#pageTitle'),
+      countText: $('#countText'),
+      // Week view
+      weekView: $('#weekView'),
+      weekTitle: $('#weekTitle span'),
+      createdAt: $('#createdAt'),
+      iframeMount: $('#iframeMount'),
+      viewerContainer: $('#viewerContainer'),
+      fsBtn: $('#fsBtn'),
+      exitFsBtn: $('#exitFsBtn'),
+      desc: $('#desc'),
+      saveHint: $('#saveHint'),
+      pdfList: $('#pdfList'),
+      editWeekBtn: $('#editWeekBtn'),
+      // Compare view
+      compareView: $('#compareView'),
+      selectA: $('#selectA'),
+      selectB: $('#selectB'),
+      swapBtn: $('#swapBtn'),
+      titleA: $('#titleA'), descA: $('#descA'), mountA: $('#mountA'),
+      titleB: $('#titleB'), descB: $('#descB'), mountB: $('#mountB'),
+      // Modal root
+      modalRoot: $('#modalRoot'),
+      // Header chips
+      countChip: $('#countChip'),
+    };
+
+    function updateCount() {
+      const n = loadWeeks().length;
+      els.countText.textContent = `${n} ${n===1?'vecka':'veckor'}`;
+    }
+
+    // Sidebar rendering
+    async function renderSidebar(filter='') {
+      const list = listWeeks().filter(w => {
+        if (!filter) return true;
+        const q = filter.toLowerCase();
+        return (w.label || '').toLowerCase().includes(q) || (w.description || '').toLowerCase().includes(q);
+      });
+      els.weekList.innerHTML = '';
+      els.emptyState.classList.toggle('hidden', list.length !== 0);
+      for (const w of list) {
+        const tpl = document.importNode($('#weekItemTemplate').content, true);
+        const root = tpl.firstElementChild;
+        const thumb = root.querySelector('.thumb');
+        const label = root.querySelector('.label');
+        const sub = root.querySelector('.muted');
+        label.textContent = w.label || 'Namnlös vecka';
+        sub.textContent = fmtDate(w.createdAt);
+        if (w.thumbBlobId) {
+          const rec = await getBlob(w.thumbBlobId);
+          if (rec?.blob) {
+            const url = URL.createObjectURL(rec.blob);
+            const img = new Image();
+            img.src = url; img.alt = `Tumnagel ${w.label}`; img.loading = 'lazy'; img.style.width='100%'; img.style.height='100%'; img.style.objectFit='cover';
+            thumb.innerHTML = ''; thumb.appendChild(img);
+          } else renderAvatar(thumb, w.label);
+        } else {
+          renderAvatar(thumb, w.label);
+        }
+        root.querySelector('.viewBtn').addEventListener('click', () => {
+          location.hash = `#week/${w.id}`;
+        });
+        root.querySelector('.editBtn').addEventListener('click', () => openWeekDialog(w));
+        root.querySelector('.delBtn').addEventListener('click', async () => {
+          const ok = await confirmDialog(`Ta bort “${w.label}”?`, 'Den går inte att ångra. Bilagor raderas.');
+          if (ok) { deleteWeek(w.id); renderAll(); }
+        });
+        els.weekList.appendChild(tpl);
+      }
+    }
+
+    // Main route rendering
+    async function renderRoute() {
+      const route = parseRoute();
+      els.weekView.classList.add('hidden');
+      els.compareView.classList.add('hidden');
+      els.openNewTab.classList.add('hidden');
+      if (route.view === 'week') {
+        const w = loadWeeks().find(x => x.id === route.id);
+        if (!w) { location.hash = ''; return; }
+        els.pageTitle.textContent = w.label || 'Vecka';
+        $('#weekTitle span').textContent = w.label || 'Vecka';
+        els.createdAt.textContent = `Skapad ${fmtDate(w.createdAt)}`;
+        renderViewer(els.iframeMount, w);
+        els.desc.value = w.description || '';
+        els.desc.onblur = () => { updateWeek(w.id, { description: els.desc.value }); };
+        await renderPdfList(w);
+        els.editWeekBtn.onclick = () => openWeekDialog(w);
+        els.weekView.classList.remove('hidden');
+        els.openNewTab.classList.toggle('hidden', !w.embedSrc);
+        if (w.embedSrc) { els.openNewTab.href = w.embedSrc; els.openNewTab.textContent = 'Öppna i ny flik'; }
+      } else if (route.view === 'compare') {
+        const a = loadWeeks().find(x => x.id === route.a);
+        const b = loadWeeks().find(x => x.id === route.b);
+        els.pageTitle.textContent = 'Jämförläge';
+        await renderCompare(a, b);
+        els.compareView.classList.remove('hidden');
+      } else {
+        els.pageTitle.textContent = 'Översikt';
+      }
+    }
+
+    function renderViewer(mount, week) {
+      mount.innerHTML = '';
+      const container = mount.parentElement.closest('.viewer');
+      container.setAttribute('sandbox', ''); // not applicable to div but kept as marker
+      container.addEventListener('contextmenu', e => e.preventDefault());
+      if (!week.embedSrc) {
+        const empty = document.createElement('div');
+        empty.className = 'card';
+        empty.style.margin = '8px';
+        empty.innerHTML = `<p class="muted">Ingen Polycam-iframe ännu. Klicka <strong>Redigera</strong> för att klistra in koden.</p>`;
+        mount.appendChild(empty);
+        return;
+      }
+      const frame = buildPolycamIframe(week.embedSrc, week.label || 'Polycam-modell');
+      // "Sandbox" – vi kan inte lägga sandbox direkt på iframe med allow-downloads blockerat utan att riskera att det inte fungerar.
+      // Vi sätter ändå strikt referrerpolicy och ingen möjlighet till styrning utifrån.
+      mount.appendChild(frame);
+    }
+
+    async function renderPdfList(week) {
+      els.pdfList.innerHTML = '';
+      const ids = week.pdfBlobIds || [];
+      if (!ids.length) {
+        els.pdfList.innerHTML = `<div class="muted">Inga bilagor.</div>`;
+        return;
+      }
+      for (const id of ids) {
+        const card = document.createElement('button');
+        card.className = 'pdf-card';
+        card.type = 'button';
+        const meta = await getBlob(id); // läs namn utan att skapa URL ännu
+        const name = meta?.name || 'Bilaga';
+        card.innerHTML = `<span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:70%;">📄 ${name}</span><span class="chip">Visa</span>`;
+        card.addEventListener('click', async () => {
+          // Hämta blob och visa i intern modal via object/iframe (utan download)
+          const rec = await getBlob(id);
+          if (!rec?.blob) return;
+          const url = URL.createObjectURL(rec.blob);
+          openPdfModal(url, name);
+        });
+        els.pdfList.appendChild(card);
+      }
+    }
+
+    async function renderCompare(a, b) {
+      const weeks = listWeeks();
+      function fillSelect(sel, selectedId) {
+        sel.innerHTML = '';
+        for (const w of weeks) {
+          const opt = document.createElement('option');
+          opt.value = w.id; opt.textContent = w.label || 'Vecka';
+          if (w.id === selectedId) opt.selected = true;
+          sel.appendChild(opt);
+        }
+      }
+      fillSelect(els.selectA, a?.id);
+      fillSelect(els.selectB, b?.id);
+      const setHash = () => {
+        const idA = els.selectA.value || weeks[0]?.id || '';
+        const idB = els.selectB.value || weeks[1]?.id || idA;
+        location.hash = `#compare/${idA}/${idB}`;
+      };
+      els.selectA.onchange = setHash;
+      els.selectB.onchange = setHash;
+
+      els.mountA.innerHTML = ''; els.mountB.innerHTML = '';
+      els.titleA.textContent = a?.label || '—';
+      els.titleB.textContent = b?.label || '—';
+      els.descA.textContent = a?.description || '';
+      els.descB.textContent = b?.description || '';
+      if (a?.embedSrc) els.mountA.appendChild(buildPolycamIframe(a.embedSrc, a.label));
+      if (b?.embedSrc) els.mountB.appendChild(buildPolycamIframe(b.embedSrc, b.label));
+
+      // Fullskärm per sida
+      els.fsA.onclick = () => requestFullscreen(els.mountA.parentElement);
+      els.fsB.onclick = () => requestFullscreen(els.mountB.parentElement);
+
+      // Swap
+      els.swapBtn.onclick = () => {
+        const tmp = els.selectA.value;
+        els.selectA.value = els.selectB.value;
+        els.selectB.value = tmp;
+        setHash();
+      };
+    }
+
+    // =============== Fullscreen helpers ===============
+    function requestFullscreen(el) { el.requestFullscreen?.(); }
+    document.addEventListener('fullscreenchange', () => {
+      const active = !!document.fullscreenElement;
+      els.exitFsBtn.hidden = !active;
+    });
+    els.fsBtn.onclick = () => requestFullscreen(els.viewerContainer);
+    els.exitFsBtn.onclick = () => document.exitFullscreen?.();
+
+    // =============== Search ===============
+    els.searchInput.addEventListener('input', debounce(() => {
+      renderSidebar(els.searchInput.value.trim());
+    }, 200));
+
+    // =============== Sidebar controls ===============
+    let sidebarHidden = false;
+    function setSidebarVisible(v) {
+      sidebarHidden = !v;
+      if (v) els.sidebar.classList.remove('hidden');
+      else els.sidebar.classList.add('hidden');
+    }
+    $('#collapseBtn').onclick = () => setSidebarVisible(sidebarHidden);
+    $('#hideSidebar').onclick = () => setSidebarVisible(sidebarHidden);
+
+    // =============== Compare toggle ===============
+    els.compareToggle.onclick = () => {
+      const weeks = listWeeks();
+      if (weeks.length >= 2) {
+        location.hash = `#compare/${weeks[0].id}/${weeks[1].id}`;
+      } else {
+        alertDialog('Behöver minst två veckor för jämförelse.');
+      }
+    };
+
+    // =============== Add/Edit Week Dialog ===============
+    async function openWeekDialog(week=null) {
+      const isEdit = !!week;
+      const id = week?.id || uuid();
+      const defaultLabel = week?.label || suggestWeekLabel();
+      const html = `
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="dlgTitle">
+          <header>
+            <h3 id="dlgTitle" class="title">${isEdit?'Redigera vecka':'Ny vecka'}</h3>
+            <button data-close class="menu-btn" aria-label="Stäng">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </header>
+          <div>
+            <div class="field">
+              <label for="label">Veckonamn</label>
+              <input id="label" value="${escapeHtml(defaultLabel)}" />
+            </div>
+            <div class="field">
+              <label for="iframe">Polycam iframekod</label>
+              <textarea id="iframe" placeholder="&lt;iframe src='https://poly.cam/...' ...&gt;&lt;/iframe&gt;" rows="4">${escapeHtml(week?.embedSrc ? `<iframe src="${week.embedSrc}"></iframe>` : '')}</textarea>
+              <span class="muted" style="font-size:12px;">Endast https://*.poly.cam/ tillåts.</span>
+              <div id="iframeError" class="danger" aria-live="polite"></div>
+            </div>
+            <div class="field">
+              <label for="descInput">Veckans beskrivning</label>
+              <textarea id="descInput" rows="4" placeholder="Kort text...">${escapeHtml(week?.description || '')}</textarea>
+            </div>
+            <div class="row">
+              <div class="field" style="flex:1;">
+                <label for="thumb">Tumnagel (valfritt)</label>
+                <input id="thumb" type="file" accept="image/*" />
+                <div class="muted" style="font-size:12px;">Skalas ner automatiskt.</div>
+              </div>
+              <div class="field" style="flex:1;">
+                <label for="pdfs">PDF-bilagor</label>
+                <input id="pdfs" type="file" accept="application/pdf" multiple />
+              </div>
+            </div>
+          </div>
+          <footer>
+            ${isEdit ? '<button class="btn-danger" data-delete>Ta bort</button>' : ''}
+            <button class="btn-ghost" data-close>Avbryt</button>
+            <button class="btn-primary" data-save>Spara</button>
+          </footer>
+        </div>
+      `;
+      const { root, trap } = openModal(html);
+      const labelEl = $('#label', root);
+      const iframeEl = $('#iframe', root);
+      const descEl = $('#descInput', root);
+      const thumbEl = $('#thumb', root);
+      const pdfEl = $('#pdfs', root);
+      const errEl = $('#iframeError', root);
+
+      $('[data-save]', root).onclick = async () => {
+        // Validering & sanering
+        let embedSrc = week?.embedSrc || '';
+        const raw = iframeEl.value.trim();
+        if (raw) {
+          try { embedSrc = sanitizePolycamIframe(raw); errEl.textContent = ''; }
+          catch (e) { errEl.textContent = e.message || 'Ogiltig iframe-kod.'; return; }
+        } else {
+          embedSrc = ''; // tillåtet att lämna tomt
+        }
+
+        let thumbBlobId = week?.thumbBlobId || null;
+        if (thumbEl.files && thumbEl.files[0]) {
+          const downsized = await downscaleImage(thumbEl.files[0]);
+          thumbBlobId = `files:thumb:${uuid()}`;
+          await putBlob(thumbBlobId, downsized, downsized.name, downsized.type);
+        }
+
+        let pdfBlobIds = week?.pdfBlobIds ? [...week.pdfBlobIds] : [];
+        if (pdfEl.files && pdfEl.files.length) {
+          for (const f of pdfEl.files) {
+            const key = `files:pdf:${uuid()}`;
+            await putBlob(key, f, f.name, f.type);
+            pdfBlobIds.push(key);
+          }
+        }
+
+        const rec = {
+          id,
+          label: labelEl.value.trim() || defaultLabel,
+          embedSrc,
+          description: descEl.value.trim(),
+          thumbBlobId,
+          pdfBlobIds,
+          createdAt: week?.createdAt || now()
+        };
+        if (isEdit) updateWeek(id, rec);
+        else saveWeek(rec);
+        closeModal();
+        renderAll();
+        location.hash = `#week/${id}`;
+      };
+
+      $('[data-delete]', root)?.addEventListener('click', async () => {
+        const ok = await confirmDialog(`Ta bort “${week.label}”?`, 'Bilagor raderas.');
+        if (ok) { deleteWeek(week.id); closeModal(); renderAll(); }
+      });
+
+      $$('[data-close]', root).forEach(b => b.addEventListener('click', closeModal));
+      requestAnimationFrame(() => labelEl.focus());
+      trap();
+    }
+
+    function suggestWeekLabel() {
+      // Förslag "Vecka NN" (sv-SE)
+      const d = new Date();
+      const firstJan = new Date(d.getFullYear(), 0, 1);
+      const days = Math.floor((d - firstJan) / 86400000);
+      const week = Math.ceil((days + firstJan.getDay() + 1) / 7);
+      return `Vecka ${week}`;
+    }
+
+    // =============== PDF Modal Viewer ===============
+    function openPdfModal(url, name='Bilaga') {
+      const html = `
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pdfTitle">
+          <header>
+            <h3 id="pdfTitle" class="title">PDF – ${escapeHtml(name)}</h3>
+            <button data-close class="menu-btn" aria-label="Stäng">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </header>
+          <div oncontextmenu="event.preventDefault()">
+            <object data="${url}" type="application/pdf" style="width:100%;height:70vh;border:1px solid var(--border);border-radius:12px;"
+              sandbox="allow-scripts allow-same-origin" referrerpolicy="no-referrer">
+              <iframe src="${url}" title="PDF" style="width:100%;height:70vh;border:0;" sandbox="allow-scripts allow-same-origin" referrerpolicy="no-referrer"></iframe>
+            </object>
+            <p class="muted" style="font-size:12px;margin-top:6px;">Högerklick är inaktiverat. Nedladdning erbjuds inte.</p>
+          </div>
+          <footer>
+            <button class="btn-primary" data-close>Stäng</button>
+          </footer>
+        </div>
+      `;
+      const { root, trap } = openModal(html);
+      $$('[data-close]', root).forEach(b => b.addEventListener('click', closeModal));
+      trap();
+    }
+
+    // =============== Generic Modals (focus trap) ===============
+    function openModal(innerHtml) {
+      els.modalRoot.innerHTML = '';
+      els.modalRoot.className = 'modal-backdrop';
+      els.modalRoot.removeAttribute('aria-hidden');
+      const wrap = document.createElement('div');
+      wrap.innerHTML = innerHtml;
+      const modal = wrap.firstElementChild;
+      els.modalRoot.appendChild(modal);
+
+      // Close behavior
+      function keyHandler(e) {
+        if (e.key === 'Escape') closeModal();
+        if (e.key === 'Tab') trapFocus(modal, e);
+      }
+      document.addEventListener('keydown', keyHandler);
+      els.modalRoot.addEventListener('click', (e) => { if (e.target === els.modalRoot) closeModal(); });
+
+      const trap = () => {
+        const focusables = $$('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])', modal).filter(el=>!el.disabled);
+        (focusables[0] || modal).focus();
+      };
+      openModal._cleanup = () => document.removeEventListener('keydown', keyHandler);
+      return { root: modal, trap };
+    }
+    function closeModal() {
+      els.modalRoot.className = 'hidden';
+      els.modalRoot.setAttribute('aria-hidden', 'true');
+      els.modalRoot.innerHTML = '';
+      openModal._cleanup?.();
+    }
+    function trapFocus(modal, e) {
+      const focusables = $$('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])', modal).filter(el=>!el.disabled);
+      if (!focusables.length) return;
+      const first = focusables[0], last = focusables[focusables.length - 1];
+      if (e.shiftKey && document.activeElement === first) { last.focus(); e.preventDefault(); }
+      else if (!e.shiftKey && document.activeElement === last) { first.focus(); e.preventDefault(); }
+    }
+
+    // =============== Simple Alerts/Confirms ===============
+    function alertDialog(text) {
+      const html = `
+        <div class="modal" role="dialog" aria-modal="true" aria-labelledby="alertTitle">
+          <header><h3 id="alertTitle" class="title">Meddelande</h3></header>
+          <p>${escapeHtml(text)}</p>
+          <footer><button class="btn-primary" data-close>OK</button></footer>
+        </div>`;
+      const { root, trap } = openModal(html);
+      $$('[data-close]', root).forEach(b => b.addEventListener('click', closeModal));
+      trap();
+    }
+    function confirmDialog(title, body='') {
+      return new Promise(resolve => {
+        const html = `
+          <div class="modal" role="dialog" aria-modal="true" aria-labelledby="confTitle">
+            <header><h3 id="confTitle" class="title">${escapeHtml(title)}</h3></header>
+            <p>${escapeHtml(body)}</p>
+            <footer>
+              <button class="btn-ghost" data-no>Avbryt</button>
+              <button class="btn-danger" data-yes>Ta bort</button>
+            </footer>
+          </div>`;
+        const { root, trap } = openModal(html);
+        $('[data-no]', root).onclick = () => { closeModal(); resolve(false); };
+        $('[data-yes]', root).onclick = () => { closeModal(); resolve(true); };
+        trap();
+      });
+    }
+
+    // =============== Helpers ===============
+    function escapeHtml(s='') {
+      return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+    }
+
+    // =============== Seed data ===============
+    function ensureSeed() {
+      const weeks = loadWeeks();
+      if (!weeks.length) {
+        saveWeek({
+          id: uuid(),
+          label: 'Vecka 34',
+          embedSrc: '', // användaren kan klistra in senare
+          description: '',
+          thumbBlobId: null,
+          pdfBlobIds: [],
+          createdAt: now()
+        });
+      }
+    }
+
+    // =============== Login wiring ===============
+    els.loginForm.addEventListener('submit', (e) => {
+      e.preventDefault();
+      const user = $('#user').value.trim();
+      const pass = $('#pass').value.trim();
+      if (user === 'admin1' && pass === 'admin1') {
+        setLoggedIn();
+        showApp();
+      } else {
+        els.loginError.textContent = 'Felaktiga uppgifter.';
+      }
+    });
+
+    function showApp() {
+      applyTheme();
+      ensureSeed();
+      $('#loginView').classList.add('hidden');
+      $('#app').classList.remove('hidden');
+      $('#app').removeAttribute('aria-hidden');
+      renderAll();
+      renderRoute();
+    }
+
+    // =============== Global actions ===============
+    els.themeBtn.onclick = toggleTheme;
+    els.logoutBtn.onclick = logout;
+    els.resetBtn.onclick = async () => {
+      const ok = await confirmDialog('Rensa all lagring?', 'Veckor och bilagor raderas.');
+      if (!ok) return;
+      localStorage.removeItem(WEEKS_KEY);
+      indexedDB.deleteDatabase(DB_NAME);
+      renderAll();
+    };
+    els.addWeekBtn.onclick = () => openWeekDialog();
+    els.openNewTab.onclick = (e) => { /* link set in render */ };
+
+    // =============== Render All ===============
+    async function renderAll() {
+      updateCount();
+      await renderSidebar(els.searchInput.value.trim());
+      renderRoute();
+    }
+
+    // =============== Init ===============
+    applyTheme();
+    if (isLoggedIn()) showApp();
+
+    // Accessibility: prevent contextmenu globally for specific zones
+    $('#viewerContainer').addEventListener('contextmenu', e => e.preventDefault());
+    $('#compareView').addEventListener('contextmenu', e => e.preventDefault());
+
+  })();
+  </script>
+</body>
+</html>
